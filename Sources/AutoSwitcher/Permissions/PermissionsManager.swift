@@ -92,12 +92,28 @@ final class PermissionsManager: ObservableObject {
 
     // MARK: - Polling
 
+    private var pollTick = 0
+
     private func startPolling() {
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self else { return }
-            let ax = AXIsProcessTrusted()
-            let im = self.readInputMonitoring()
+            self.pollTick += 1
+
+            // Secure Input is a cheap in-process check — every tick.
             let secure = Bool(IsSecureEventInputEnabled())
+
+            // The TCC checks are cross-process IPC to tccd. While waiting
+            // for the user to grant permissions we poll every second for
+            // snappy onboarding feedback; once everything is granted a 5 s
+            // cadence is plenty (revocation is rare) and stops the constant
+            // 1 Hz IPC churn that showed up in the unified log.
+            var ax = self.isAXTrusted
+            var im = self.isInputMonitoringOK
+            if !self.isTrusted || self.pollTick % 5 == 0 {
+                ax = AXIsProcessTrusted()
+                im = self.readInputMonitoring()
+            }
+
             DispatchQueue.main.async {
                 self.update(ax: ax, im: im)
                 if self.isSecureInputActive != secure {

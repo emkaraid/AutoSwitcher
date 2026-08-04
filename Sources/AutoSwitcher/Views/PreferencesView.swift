@@ -106,6 +106,15 @@ struct PreferencesView: View {
             }
         }
         .formStyle(.grouped)
+        .onAppear {
+            // The real autostart state lives in SMAppService and can be
+            // changed behind our back in System Settings → Login Items.
+            // Sync the toggle with reality every time the pane opens.
+            let actual = LoginItemManager.isEnabled
+            if launchAtLogin != actual {
+                launchAtLogin = actual
+            }
+        }
     }
 
     @ViewBuilder

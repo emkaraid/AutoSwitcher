@@ -110,8 +110,8 @@ echo "     enable AutoSwitcher there too."
 echo
 echo "  The app auto-restarts as soon as Input Monitoring is granted."
 echo
-echo "  Diagnostics file:  /tmp/autoswitcher_debug.log"
-echo "  Live view:         tail -f /tmp/autoswitcher_debug.log"
+echo "  Diagnostics file:  ~/Library/Logs/AutoSwitcher/debug.log"
+echo "  Live view:         tail -f ~/Library/Logs/AutoSwitcher/debug.log"
 echo "================================================================"
 echo
 
