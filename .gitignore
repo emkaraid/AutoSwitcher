@@ -1,0 +1,14 @@
+# Build artifacts
+.build/
+dist/
+*.app
+*.dmg
+build.log
+
+# macOS detritus
+.DS_Store
+._*
+
+# Xcode / SwiftPM local state
+.swiftpm/
+xcuserdata/
