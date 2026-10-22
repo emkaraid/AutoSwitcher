@@ -11,7 +11,7 @@ import AppKit
 
 struct PreferencesView: View {
     @AppStorage(AppSettings.Keys.engineEnabled)         private var engineEnabled: Bool = true
-    @AppStorage(AppSettings.Keys.smartUndoEnabled)      private var smartUndoEnabled: Bool = true
+    @AppStorage(AppSettings.Keys.smartUndoEnabled)      private var smartUndoEnabled: Bool = false
     @AppStorage(AppSettings.Keys.playSoundOnSwitch)     private var playSound: Bool = false
     @AppStorage(AppSettings.Keys.ignoreWordsWithDigits) private var ignoreDigits: Bool = true
     @AppStorage(AppSettings.Keys.launchAtLogin)         private var launchAtLogin: Bool = false
@@ -19,7 +19,7 @@ struct PreferencesView: View {
     @AppStorage(AppSettings.Keys.optionTapEnabled)      private var optionTapEnabled: Bool = true
     @AppStorage(AppSettings.Keys.correctOnEnter)        private var correctOnEnter: Bool = false
     @AppStorage(AppSettings.Keys.convertSelectionEnabled) private var convertSelection: Bool = true
-    @AppStorage(AppSettings.Keys.autoLearnEnabled)      private var autoLearn: Bool = true
+    @AppStorage(AppSettings.Keys.autoLearnEnabled)      private var autoLearn: Bool = false
     @AppStorage(AppSettings.Keys.verboseLogging)        private var verboseLogging: Bool = false
 
     @EnvironmentObject private var permissions: PermissionsManager

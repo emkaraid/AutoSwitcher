@@ -106,6 +106,14 @@ expectWrong(";", .english, "ж", name: "standalone ';' → 'ж'")
 expectWrong("yt", .english, "не")
 expectWrong("gj", .english, "по")
 expectCorrect("pf", .english, name: "pf is a known EN abbreviation — by design")
+expectWrong(",sk", .english, "был", name: "б-key counts as a letter: ,sk → был")
+expectWrong(",snm", .english, "быть", name: ",snm → быть")
+expectWrong("nt,z", .english, "тебя", name: "nt,z → тебя")
+expectWrong(";ehyfk", .english, "журнал", name: ";ehyfk → журнал")
+expectWrong("cvjnhb", .english, "смотри")
+for w in ["it's", "don't", "e.g.", "U.S.", "hello."] {
+    expectCorrect(w, .english, name: "\(w) (en) untouched despite punctuation keys")
+}
 
 print("\n== EN mode: real English untouched ==")
 for w in ["hello", "http", "https", "www", "myth", "test", "a", "I", "...", "hello,", "world;"] {

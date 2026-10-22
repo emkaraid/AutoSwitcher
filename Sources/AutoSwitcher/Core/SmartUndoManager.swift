@@ -42,17 +42,22 @@ final class SmartUndoManager {
 
     // MARK: - Auto-learn
 
-    /// Per-session revert tally, case-insensitive. When the same word is
-    /// reverted twice the engine auto-adds it to the Dictionary (if the
-    /// auto-learn preference is on) instead of asking again and again.
-    private var revertCounts: [String: Int] = [:]
+    /// Recent reverts per word (case-insensitive). When the same word is
+    /// reverted twice within `learnWindow` the engine auto-adds it to the
+    /// Dictionary (if the auto-learn preference is on). The window matters:
+    /// two accidental reverts a quarter of an hour apart are not a pattern.
+    private var revertTimes: [String: [Date]] = [:]
+    private let learnWindow: TimeInterval = 10 * 60
 
-    /// Record one more revert of `word` and return the running count.
+    /// Record one more revert of `word` and return how many reverts of it
+    /// happened within the learning window (including this one).
     func registerRevert(word: String) -> Int {
         lock.lock(); defer { lock.unlock() }
         let key = word.lowercased()
-        let count = (revertCounts[key] ?? 0) + 1
-        revertCounts[key] = count
-        return count
+        let cutoff = Date().addingTimeInterval(-learnWindow)
+        var times = (revertTimes[key] ?? []).filter { $0 > cutoff }
+        times.append(Date())
+        revertTimes[key] = times
+        return times.count
     }
 }

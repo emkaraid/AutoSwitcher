@@ -15,19 +15,24 @@
 #   ./build.sh              # release build → ./AutoSwitcher.app
 #   ./build.sh debug
 #   CLEAN=1 ./build.sh      # wipe .build and rebuild from scratch
-#   SIGN=adhoc ./build.sh   # force the old ad-hoc signing
+#   SIGN=adhoc ./build.sh   # force ad-hoc signing
+#   SIGN=stable ./build.sh  # create the identity if missing, then use it
 #
 set -euo pipefail
 
 CONFIG="${1:-release}"
 CLEAN="${CLEAN:-0}"
-SIGN="${SIGN:-adhoc}"                # adhoc | stable
-# NOTE: macOS Sequoia tracks TCC entries by cdhash, not signing authority,
-# for self-signed certs. So "stable" mode doesn't actually carry Input
-# Monitoring/Accessibility permissions across rebuilds for our case — it
-# only matters for Apple-issued Developer ID Application certs. We default
-# to adhoc to avoid keychain password prompts; the app now handles
-# permission grants by auto-restarting when it sees IM transition to true.
+SIGN="${SIGN:-auto}"                 # auto | adhoc | stable
+# Why signing identity matters: TCC (Accessibility / Input Monitoring)
+# stores the app's *designated requirement* when the user grants access.
+#   ad-hoc      → DR is `cdhash H"…"`: every rebuild is a "new app" and the
+#                 permissions have to be granted again after each update.
+#   self-signed → DR is `identifier "com.autoswitcher.app" and certificate
+#                 leaf = H"…"`: every build signed with the same cert
+#                 satisfies it, so grants survive updates.
+# auto = use the "AutoSwitcher Local Dev" identity if it is already in the
+# keychain (no prompts, nothing created), otherwise fall back to ad-hoc —
+# so a fresh clone still builds without touching anyone's keychain.
 SIGN_CN="AutoSwitcher Local Dev"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -173,6 +178,14 @@ if [[ ! -f "${ENTITLEMENTS}" ]]; then
 </dict>
 </plist>
 EOF
+fi
+
+has_identity() {
+    security find-identity -v -p codesigning 2>/dev/null | grep -F -q "\"${SIGN_CN}\""
+}
+
+if [[ "${SIGN}" == "auto" ]]; then
+    if has_identity; then SIGN="stable"; else SIGN="adhoc"; fi
 fi
 
 if [[ "${SIGN}" == "stable" ]]; then

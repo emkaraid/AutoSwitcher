@@ -59,7 +59,10 @@ enum AppSettings {
     static func registerDefaults() {
         UserDefaults.standard.register(defaults: [
             Keys.engineEnabled: true,
-            Keys.smartUndoEnabled: true,
+            // Off by default: a Backspace right after a correction is just as
+            // often "delete that space / fix the comma" as "undo", and an
+            // unwanted revert is worse than none. ⌥ tap is the explicit undo.
+            Keys.smartUndoEnabled: false,
             Keys.playSoundOnSwitch: false,
             Keys.ignoreWordsWithDigits: true,
             Keys.whitelistWords: [String](),
@@ -70,7 +73,9 @@ enum AppSettings {
             Keys.optionTapEnabled: true,
             Keys.correctOnEnter: false,
             Keys.convertSelectionEnabled: true,
-            Keys.autoLearnEnabled: true,
+            // Off by default: two accidental reverts (even far apart) must not
+            // silently put a word in the Dictionary forever.
+            Keys.autoLearnEnabled: false,
             Keys.verboseLogging: false
         ])
     }

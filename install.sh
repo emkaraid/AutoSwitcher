@@ -84,10 +84,18 @@ echo "==> Code signature of the installed binary:"
 codesign -dv --verbose=2 "$INSTALLED" 2>&1 | sed 's/^/    /'
 echo
 
-# ---------- 4. Reset stale TCC entries ---------------------------------
-echo "==> Resetting any old TCC entries for ${BUNDLE_ID}"
-tccutil reset Accessibility "$BUNDLE_ID" 2>/dev/null || true
-tccutil reset ListenEvent    "$BUNDLE_ID" 2>/dev/null || true
+# ---------- 4. Reset stale TCC entries (ad-hoc builds only) ------------
+# An ad-hoc signature's designated requirement is its cdhash, so the old
+# TCC entry can never match the new build and only gets in the way. A
+# build signed with the stable "AutoSwitcher Local Dev" identity matches
+# the existing entry — resetting it would throw away working permissions.
+if codesign -d -r- "$INSTALLED" 2>&1 | grep -q 'designated => cdhash'; then
+    echo "==> Ad-hoc build: resetting old TCC entries for ${BUNDLE_ID}"
+    tccutil reset Accessibility "$BUNDLE_ID" 2>/dev/null || true
+    tccutil reset ListenEvent    "$BUNDLE_ID" 2>/dev/null || true
+else
+    echo "==> Stable signature: keeping existing permissions"
+fi
 
 # ---------- 5. Launch from /Applications -------------------------------
 echo "==> Launching"

@@ -149,7 +149,10 @@ struct LayoutDetector {
                 return .looksCorrect
             }
 
-            let letters = word.filter { $0.isLetter }
+            // Count the keys that are LETTERS in the Russian layout, not just
+            // Latin letters: in ",sk" (= "был") the ',' is the б key. Counting
+            // only isLetter gave 2 and the word was skipped as too short.
+            let letters = word.filter { $0.isLetter || producesRussianLetter($0) }
 
             // 2) Static heuristic: no English vowels, 3+ chars, translates
             //    into plausible Russian → wrong layout. The dictionary gate
