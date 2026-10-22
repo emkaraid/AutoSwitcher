@@ -154,6 +154,15 @@ check("!(1.4.0 > 1.4.0)", !UpdateChecker.isNewer("1.4.0", than: "1.4.0"))
 check("!(1.3.9 > 1.4.0)", !UpdateChecker.isNewer("1.3.9", than: "1.4.0"))
 check("1.4.0.1 > 1.4.0", UpdateChecker.isNewer("1.4.0.1", than: "1.4.0"))
 
+print("\n== UpdateChecker.dmgURL ==")
+let sampleRelease: [String: Any] = ["tag_name": "v9.9.9", "assets": [
+    ["name": "notes.txt", "browser_download_url": "https://example.com/notes.txt"],
+    ["name": "AutoSwitcher-9.9.9.dmg", "browser_download_url": "https://github.com/x/y/releases/download/v9.9.9/AutoSwitcher-9.9.9.dmg"]
+]]
+check("picks the .dmg asset", UpdateChecker.dmgURL(in: sampleRelease)?.lastPathComponent == "AutoSwitcher-9.9.9.dmg")
+check("no assets → nil (falls back to page)", UpdateChecker.dmgURL(in: ["tag_name": "v1"]) == nil)
+check("non-https link rejected", UpdateChecker.dmgURL(in: ["assets": [["name": "a.dmg", "browser_download_url": "http://x/a.dmg"]]]) == nil)
+
 print("\n=================================")
 print("PASSED: \(passed)   FAILED: \(failed)")
 exit(failed == 0 ? 0 : 1)

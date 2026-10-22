@@ -4,7 +4,13 @@
 //
 //  Manual "Check for Updates…" from the menu. One GET to the GitHub
 //  Releases API, a version compare, and an alert with a Download button
-//  that opens the releases page in the browser.
+//  that hands the DMG's direct download link to the browser.
+//
+//  Why the direct link and not the release web page: the page is heavy
+//  and loads its file list in a separate request, which GitHub regularly
+//  answers with "This page is taking too long to load". The asset URL
+//  (taken from the same API response that told us an update exists) is
+//  served straight from GitHub's CDN.
 //
 //  Privacy note: this is the ONLY network request the app can make, and it
 //  happens exclusively when the user clicks the menu item — never in the
@@ -37,11 +43,27 @@ enum UpdateChecker {
                let tag = json["tag_name"] as? String {
                 let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
                 outcome = isNewer(latest, than: currentVersion)
-                    ? .updateAvailable(latest)
+                    ? .updateAvailable(latest, download: dmgURL(in: json))
                     : .upToDate
             }
             DispatchQueue.main.async { present(outcome) }
         }.resume()
+    }
+
+    /// The release's DMG asset, if it has one. Falls back to nil — the
+    /// caller then opens the release page instead.
+    static func dmgURL(in release: [String: Any]) -> URL? {
+        let assets = release["assets"] as? [[String: Any]] ?? []
+        for asset in assets {
+            if let name = asset["name"] as? String,
+               name.lowercased().hasSuffix(".dmg"),
+               let link = asset["browser_download_url"] as? String,
+               let url = URL(string: link),
+               url.scheme == "https" {
+                return url
+            }
+        }
+        return nil
     }
 
     /// Numeric dotted-version compare: returns true when `candidate` is
@@ -60,7 +82,7 @@ enum UpdateChecker {
     // MARK: - UI
 
     private enum Outcome {
-        case updateAvailable(String)
+        case updateAvailable(String, download: URL?)
         case upToDate
         case error
     }
@@ -71,7 +93,7 @@ enum UpdateChecker {
         alert.alertStyle = .informational
 
         switch outcome {
-        case .updateAvailable(let version):
+        case .updateAvailable(let version, let download):
             Diag.log("update check: \(version) available (current \(currentVersion))")
             alert.messageText = l10n.t("upd.available", version)
             alert.informativeText = l10n.t("upd.availableInfo", currentVersion)
@@ -79,7 +101,8 @@ enum UpdateChecker {
             alert.addButton(withTitle: l10n.t("upd.later"))
             NSApp.activate(ignoringOtherApps: true)
             if alert.runModal() == .alertFirstButtonReturn {
-                NSWorkspace.shared.open(releasesPage)
+                // Direct DMG link when the release has one; the page otherwise.
+                NSWorkspace.shared.open(download ?? releasesPage)
             }
         case .upToDate:
             Diag.log("update check: up to date (\(currentVersion))")

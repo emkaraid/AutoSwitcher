@@ -75,8 +75,8 @@ final class L10n: ObservableObject {
 
         // Update checker
         "upd.available":        ("AutoSwitcher %@ is available", "Доступна версия AutoSwitcher %@"),
-        "upd.availableInfo":    ("You have %@. The download page will open in your browser.",
-                                 "У вас установлена %@. Страница загрузки откроется в браузере."),
+        "upd.availableInfo":    ("You have %@. The new DMG will be downloaded by your browser — open it and drag AutoSwitcher to Applications.",
+                                 "У вас установлена %@. Браузер скачает новый DMG — откройте его и перетащите AutoSwitcher в «Программы»."),
         "upd.download":         ("Download", "Скачать"),
         "upd.later":            ("Later", "Позже"),
         "upd.latest":           ("You're up to date", "У вас последняя версия"),
