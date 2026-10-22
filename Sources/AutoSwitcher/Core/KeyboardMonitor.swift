@@ -19,6 +19,8 @@
 //   - We never touch keystrokes when Secure Input is active.
 //   - We never touch keystrokes for blacklisted apps.
 //   - We never touch our own synthesized events (tagged via user data).
+//   - Keys typed DURING a correction are held back and replayed after it,
+//     so they can't interleave with the corrector's backspaces.
 //
 
 import Foundation
@@ -64,16 +66,27 @@ final class KeyboardMonitor {
     /// flag is still false.
     private var userTypedSinceCorrection = true
 
-    /// The last finished word (word + its boundary char) still sitting right
-    /// before the caret — the target for manual ⌥ conversion. Cleared by
-    /// anything that moves the caret (clicks, arrows, Enter, shortcuts).
+    /// The last finished word (word + every boundary char typed after it)
+    /// still sitting right before the caret — the target for manual ⌥
+    /// conversion. Kept in sync with the screen: extra spaces/punctuation
+    /// extend it, Backspace shrinks it, anything that moves the caret
+    /// (clicks, arrows, Enter, shortcuts) clears it.
     private var lastCompleted: (word: String, boundary: String, at: Date)?
 
     /// How long after the fact a ⌥ tap may still revert / re-convert.
     private let optionRevertWindow: TimeInterval = 30
 
-    /// We need a stable strong-self pointer for the C trampoline.
-    private static var sharedSelfPointer: UnsafeMutableRawPointer?
+    /// True right after the user converted the word being typed with ⌥:
+    /// that word is the user's explicit choice, so the detector must not
+    /// "fix" it back at the next boundary. Reset together with the buffer.
+    private var manualWordPending = false
+
+    /// Physical keystrokes swallowed while a correction is being typed. The
+    /// corrector takes them back via `drainQueuedKeys` and replays them in
+    /// order right after its own events. Capped so a stuck state can never
+    /// eat the keyboard — beyond the cap keys simply pass through.
+    private var queuedKeys: [(code: CGKeyCode, flags: CGEventFlags)] = []
+    private let queuedKeysLimit = 64
 
     init(permissions: PermissionsManager,
          autoCorrector: AutoCorrector,
@@ -81,6 +94,9 @@ final class KeyboardMonitor {
         self.permissions = permissions
         self.autoCorrector = autoCorrector
         self.layoutManager = layoutManager
+        autoCorrector.takeQueuedKeys = { [weak self] target in
+            self?.drainQueuedKeys(for: target) ?? []
+        }
     }
 
     deinit { stop() }
@@ -159,14 +175,17 @@ final class KeyboardMonitor {
         eventTap = nil
         tapRunLoop = nil
         clearBuffer()
+        lastCompleted = nil
         Diag.log("tap stopped")
     }
 
     // MARK: - Buffer helpers
 
     private func clearBuffer() {
-        bufferLock.lock(); defer { bufferLock.unlock() }
+        bufferLock.lock()
         typingBuffer.removeAll(keepingCapacity: true)
+        bufferLock.unlock()
+        manualWordPending = false
     }
 
     private func append(_ s: String) {
@@ -190,6 +209,46 @@ final class KeyboardMonitor {
     private func setBuffer(_ s: String) {
         bufferLock.lock(); defer { bufferLock.unlock() }
         typingBuffer = s
+    }
+
+    // MARK: - Screen-state bookkeeping (shared by live and replayed keys)
+
+    /// A boundary char was typed and NOT used for a correction: close the
+    /// word into `lastCompleted`, or — when there is no open word (second
+    /// space, "!" then space…) — extend the boundary of the previous one so
+    /// a ⌥ conversion deletes exactly what is on screen.
+    private func noteBoundary(_ typed: String) {
+        let word = snapshotBuffer()
+        clearBuffer()
+        if !word.isEmpty {
+            lastCompleted = (word, typed, Date())
+        } else if var completed = lastCompleted {
+            completed.boundary += typed
+            completed.at = Date()
+            lastCompleted = completed
+        }
+    }
+
+    /// A Backspace that is NOT a Smart Undo: mirror it on our state. With
+    /// an empty buffer it eats into the last finished word's boundary; once
+    /// the boundary is gone the word is "open" again and continues in the
+    /// buffer ("hello␣" ⌫ "s" → buffer "hellos").
+    private func noteBackspace() {
+        if !snapshotBuffer().isEmpty {
+            dropLast()
+            if snapshotBuffer().isEmpty { manualWordPending = false }
+            return
+        }
+        guard var completed = lastCompleted else { return }
+        if !completed.boundary.isEmpty {
+            completed.boundary.removeLast()
+        }
+        if completed.boundary.isEmpty {
+            setBuffer(completed.word)
+            lastCompleted = nil
+        } else {
+            lastCompleted = completed
+        }
     }
 
     // MARK: - C trampoline
@@ -223,11 +282,20 @@ final class KeyboardMonitor {
             return Unmanaged.passUnretained(event)
         }
 
+        // The user's own keystrokes, re-posted after a correction: track
+        // them (buffer / last word) but never act on them — they were typed
+        // in one burst together with the word that was just corrected.
+        if userData == AutoCorrector.replayEventUserData {
+            if type == .keyDown { handleReplayed(event: event) }
+            return Unmanaged.passUnretained(event)
+        }
+
         // Pause completely while Secure Input is active.
         // Bool(...) makes the call resilient to the Carbon importer surfacing
         // this function as either Bool or DarwinBoolean across SDK versions.
         if Bool(IsSecureEventInputEnabled()) {
             clearBuffer()
+            lastCompleted = nil
             optionTapCandidate = false
             return Unmanaged.passUnretained(event)
         }
@@ -235,13 +303,22 @@ final class KeyboardMonitor {
         // Pause if the focused app is on the ignore list.
         if AppIgnoreList.isFrontmostAppIgnored() {
             clearBuffer()
+            lastCompleted = nil
             optionTapCandidate = false
             return Unmanaged.passUnretained(event)
         }
 
-        // While a correction is being posted, hands off.
+        // While a correction is being posted, hold the user's keystrokes
+        // back: letting them through would interleave them with our
+        // synthetic backspaces ("привет" + a fast next letter → eaten or
+        // misplaced characters). The corrector replays them right after.
         if autoCorrector.isCorrecting {
             optionTapCandidate = false
+            if type == .keyDown, queuedKeys.count < queuedKeysLimit {
+                queuedKeys.append((CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode)),
+                                   event.flags))
+                return nil
+            }
             return Unmanaged.passUnretained(event)
         }
 
@@ -265,6 +342,65 @@ final class KeyboardMonitor {
 
         default:
             return Unmanaged.passUnretained(event)
+        }
+    }
+
+    // MARK: - Type-ahead (keys typed during a correction)
+
+    /// Called by the corrector on the main thread. Text keys are rendered
+    /// straight from the target layout's key map — the system's own
+    /// layout switch may still be propagating, so letting the OS translate
+    /// the key code could still produce the OLD layout's character.
+    private func drainQueuedKeys(for target: KeyboardLayout) -> [AutoCorrector.ReplayItem] {
+        let keys = queuedKeys
+        queuedKeys.removeAll()
+        return keys.map { key in
+            let flags = key.flags
+            if !flags.contains(.maskCommand),
+               !flags.contains(.maskControl),
+               !flags.contains(.maskAlternate),
+               LayoutManager.isTextKey(key.code),
+               let text = layoutManager.character(forKeyCode: key.code,
+                                                  shift: flags.contains(.maskShift),
+                                                  capsLock: flags.contains(.maskAlphaShift),
+                                                  in: target),
+               !text.isEmpty {
+                return .text(text)
+            }
+            return .key(key.code, flags)
+        }
+    }
+
+    /// Bookkeeping for a replayed keystroke: same state updates as live
+    /// typing, but no detection, no Smart Undo, no hotkeys.
+    private func handleReplayed(event: CGEvent) {
+        optionTapCandidate = false
+        userTypedSinceCorrection = true
+
+        let flags = event.flags
+        if flags.contains(.maskCommand) || flags.contains(.maskControl) || flags.contains(.maskAlternate) {
+            clearBuffer()
+            lastCompleted = nil
+            return
+        }
+        let keyCode = Int(event.getIntegerValueField(.keyboardEventKeycode))
+        if keyCode == kVK_Delete {
+            noteBackspace()
+            return
+        }
+        if Self.caretMovingKeys.contains(keyCode) {
+            clearBuffer()
+            lastCompleted = nil
+            return
+        }
+        guard let typed = unicodeString(from: event), !typed.isEmpty else { return }
+        if isFunctionKeyText(typed) {
+            clearBuffer()
+            lastCompleted = nil
+        } else if isWordBoundary(typed) {
+            noteBoundary(typed)
+        } else {
+            append(typed)
         }
     }
 
@@ -318,12 +454,7 @@ final class KeyboardMonitor {
            !userTypedSinceCorrection,
            Date().timeIntervalSince(last.timestamp) <= optionRevertWindow {
             Diag.log("⌥ tap: reverting last auto-correction")
-            let original = last.originalWrongText
-            smartUndo.remember(word: original)
-            autoCorrector.revertLastCorrection()
-            afterRevert(original: original)
-            clearBuffer()
-            lastCompleted = nil
+            revert(last)
             return
         }
 
@@ -332,8 +463,10 @@ final class KeyboardMonitor {
             Diag.log("⌥ tap: converting current word (\(word.count) chars)")
             if let converted = manualConvert(word: word, boundary: "") {
                 // Keep typing seamless: the buffer now holds the converted
-                // rendition, matching what is on screen.
+                // rendition, matching what is on screen — and the detector
+                // must respect this explicit choice at the next boundary.
                 setBuffer(converted)
+                manualWordPending = true
                 lastCompleted = nil
             }
             return
@@ -350,9 +483,30 @@ final class KeyboardMonitor {
         }
     }
 
+    /// Shared by the Backspace and ⌥ revert paths. Returns false when the
+    /// corrector refused (the caller must then let its key through).
+    @discardableResult
+    private func revert(_ last: AutoCorrector.LastCorrection) -> Bool {
+        let original = last.originalWrongText
+        guard autoCorrector.revertLastCorrection() else { return false }
+        // Remember the WRONG rendition — that is what is now on screen and
+        // what the detector must leave alone for a while.
+        smartUndo.remember(word: original)
+        Diag.logSensitive("reverted to '\(original + last.originalTrailing)'")
+        afterRevert(original: original)
+        clearBuffer()
+        // The restored text sits right before the caret again, so another
+        // ⌥ tap converts it back (as a manual conversion).
+        lastCompleted = last.originalTrailing.isEmpty
+            ? nil
+            : (original, last.originalTrailing, Date())
+        if last.originalTrailing.isEmpty { setBuffer(original) }
+        return true
+    }
+
     /// Delete `word + boundary` before the caret and retype it in the other
     /// layout. Returns the converted word on success, nil when the layout of
-    /// the text could not be determined.
+    /// the text could not be determined or the corrector was busy.
     @discardableResult
     private func manualConvert(word: String, boundary: String) -> String? {
         let layout: KeyboardLayout
@@ -368,14 +522,14 @@ final class KeyboardMonitor {
         let boundaryConverted = LayoutDetector.convert(boundary, from: layout, to: target)
         Diag.logSensitive("⌥ convert '\(word + boundary)' (\(layout.rawValue)) → '\(converted + boundaryConverted)' (\(target.rawValue))")
         let playSound = UserDefaults.standard.bool(forKey: AppSettings.Keys.playSoundOnSwitch)
-        autoCorrector.performCorrection(
+        guard autoCorrector.performCorrection(
             originalWrong: word + boundary,
             corrected: converted + boundaryConverted,
             fromLayout: layout,
             toLayout: target,
             playSound: playSound,
             isManual: true
-        )
+        ) else { return nil }
         userTypedSinceCorrection = false
         return converted
     }
@@ -400,6 +554,16 @@ final class KeyboardMonitor {
             UndoToastWindow.shared.show(originalWord: original)
         }
     }
+
+    // MARK: - Key handling
+
+    /// Keys that move the caret / leave the field: the typing buffer and
+    /// the last finished word are no longer adjacent to the caret.
+    private static let caretMovingKeys: Set<Int> = [
+        kVK_Escape, kVK_Tab, kVK_Return, kVK_ANSI_KeypadEnter, kVK_ForwardDelete,
+        kVK_LeftArrow, kVK_RightArrow, kVK_UpArrow, kVK_DownArrow,
+        kVK_Home, kVK_End, kVK_PageUp, kVK_PageDown, kVK_Help
+    ]
 
     private func handleKeyDown(event: CGEvent) -> Unmanaged<CGEvent>? {
         let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
@@ -438,14 +602,16 @@ final class KeyboardMonitor {
         // Enter: optionally run the detector on the last word BEFORE the
         // newline reaches the app (off by default — in chats this corrects
         // the message that is being sent). The physical key is eaten on
-        // correction and re-pressed by the corrector after retyping.
+        // correction and re-pressed — with its modifiers, so ⇧⏎ stays a
+        // newline — by the corrector after retyping.
         if Int(keyCode) == kVK_Return || Int(keyCode) == kVK_ANSI_KeypadEnter {
             let word = snapshotBuffer()
+            let skip = manualWordPending
             clearBuffer()
             lastCompleted = nil
             if UserDefaults.standard.bool(forKey: AppSettings.Keys.correctOnEnter),
-               !word.isEmpty,
-               evaluate(word: word, trailing: "", trailingKey: keyCode) {
+               !word.isEmpty, !skip,
+               evaluate(word: word, trailing: "", trailingKey: (keyCode, event.flags)) {
                 Diag.log("correction on Enter — eating key")
                 return nil
             }
@@ -454,14 +620,10 @@ final class KeyboardMonitor {
 
         // Bail-out keys: reset the buffer and pass through. They all move
         // the caret, so the last finished word is no longer reachable.
-        switch Int(keyCode) {
-        case kVK_Escape, kVK_Tab,
-             kVK_LeftArrow, kVK_RightArrow, kVK_UpArrow, kVK_DownArrow,
-             kVK_Home, kVK_End, kVK_PageUp, kVK_PageDown:
+        if Self.caretMovingKeys.contains(Int(keyCode)) {
             clearBuffer()
             lastCompleted = nil
             return Unmanaged.passUnretained(event)
-        default: break
         }
 
         // Smart Undo on Backspace. Only while nothing was typed since the
@@ -471,26 +633,26 @@ final class KeyboardMonitor {
             if undoEnabled, !hadTyped,
                smartUndo.shouldHandleBackspace(corrector: autoCorrector),
                let last = autoCorrector.lastCorrection,
-               !last.isManual {
-                // Eat this backspace and trigger revert. Remember the WRONG
-                // rendition — that is what the user will retype and what the
-                // detector must then leave alone.
-                let original = last.originalWrongText
-                smartUndo.remember(word: original)
-                autoCorrector.revertLastCorrection()
+               !last.isManual,
+               revert(last) {
                 Diag.log("Smart Undo fired")
-                Diag.logSensitive("Smart Undo reverted to '\(original)'")
-                afterRevert(original: original)
-                clearBuffer()
-                lastCompleted = nil
                 return nil
             }
-            dropLast()
+            noteBackspace()
             return Unmanaged.passUnretained(event)
         }
 
         // Extract the typed unicode characters from the event.
         let typed = unicodeString(from: event)
+
+        // F-keys, Fn+arrows & co. report private-use "characters"
+        // (U+F700…). They are not text: treating them as a word boundary
+        // would let a correction eat the key and type that glyph instead.
+        if let typed, isFunctionKeyText(typed) {
+            clearBuffer()
+            lastCompleted = nil
+            return Unmanaged.passUnretained(event)
+        }
 
         // Word-boundary characters: end of word, run detection on the buffer.
         //
@@ -502,17 +664,17 @@ final class KeyboardMonitor {
         // residue (the "gпривет" / "rкакая" bug from real-world testing).
         if let typed, isWordBoundary(typed) {
             let word = snapshotBuffer()
-            clearBuffer()
-            if !word.isEmpty {
+            if !word.isEmpty && !manualWordPending {
                 Diag.logSensitive("boundary '\(typed)' after word '\(word)'")
                 if evaluate(word: word, trailing: typed) {
                     Diag.log("correction triggered — eating boundary")
+                    clearBuffer()
                     lastCompleted = nil
                     return nil
                 }
-                // No correction: remember the word for manual ⌥ conversion.
-                lastCompleted = (word, typed, Date())
             }
+            // No correction: remember the word for manual ⌥ conversion.
+            noteBoundary(typed)
             return Unmanaged.passUnretained(event)
         }
 
@@ -528,11 +690,12 @@ final class KeyboardMonitor {
 
     /// Returns true if an auto-correction was actually started.
     /// `trailing` is the word-boundary character that triggered evaluation;
-    /// when correction fires it is appended to the retyped corrected text so
-    /// the focused document ends up with `corrected + boundary` and the
-    /// caller (handleKeyDown) eats the boundary key event itself.
+    /// when correction fires it is appended (converted to the target
+    /// layout) to the retyped corrected text so the focused document ends up
+    /// with `corrected + boundary`, and the caller eats the boundary key.
     @discardableResult
-    private func evaluate(word: String, trailing: String, trailingKey: CGKeyCode? = nil) -> Bool {
+    private func evaluate(word: String, trailing: String,
+                          trailingKey: (code: CGKeyCode, flags: CGEventFlags)? = nil) -> Bool {
         // Phase 7 — whitelist check.
         let whitelist = UserDefaults.standard.stringArray(forKey: AppSettings.Keys.whitelistWords) ?? []
         if whitelist.contains(where: { $0.caseInsensitiveCompare(word) == .orderedSame }) {
@@ -600,20 +763,21 @@ final class KeyboardMonitor {
             return false
         case .looksWrong(let suggested, let target):
             // The boundary key itself can mean different punctuation in the
-            // target layout: the key that types '?' in EN holds ',' in RU.
-            // Convert it along with the word ("ghbdtn?" → "привет,").
+            // target layout (on "Russian – PC" the '?' key types ','). The
+            // live key map knows the user's real layouts.
             let boundary = LayoutDetector.convert(trailing, from: layout, to: target)
             Diag.log("CORRECT \(layout.rawValue)→\(target.rawValue), \(word.count) chars")
             Diag.logSensitive("CORRECT '\(word)' (\(layout.rawValue)) → '\(suggested)' (\(target.rawValue))")
             let playSound = UserDefaults.standard.bool(forKey: AppSettings.Keys.playSoundOnSwitch)
-            autoCorrector.performCorrection(
+            guard autoCorrector.performCorrection(
                 originalWrong: word,
+                originalTrailing: trailing,
                 corrected: suggested + boundary,
                 fromLayout: layout,
                 toLayout: target,
                 playSound: playSound,
                 trailingKey: trailingKey
-            )
+            ) else { return false }
             userTypedSinceCorrection = false
             return true
         }
@@ -646,6 +810,13 @@ final class KeyboardMonitor {
         event.keyboardGetUnicodeString(maxStringLength: buffer.count, actualStringLength: &length, unicodeString: &buffer)
         if length == 0 { return nil }
         return String(utf16CodeUnits: buffer, count: length)
+    }
+
+    /// AppKit's function-key range (NSUpArrowFunctionKey … ), plus the rest
+    /// of the private-use area some keyboards report.
+    private func isFunctionKeyText(_ s: String) -> Bool {
+        guard let first = s.unicodeScalars.first else { return false }
+        return (0xF700...0xF8FF).contains(first.value)
     }
 
     private func isWordBoundary(_ s: String) -> Bool {

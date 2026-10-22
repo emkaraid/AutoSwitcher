@@ -83,6 +83,10 @@ final class LayoutState: ObservableObject {
         if now != current {
             current = now
         }
+        // The user may have switched between variants of a language
+        // ("Russian" ↔ "Russian – PC") or enabled a new layout: keep the
+        // detector's character table in step. No-op when unchanged.
+        layoutManager.refreshKeyMapIfNeeded()
     }
 }
 

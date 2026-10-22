@@ -13,10 +13,14 @@ import ServiceManagement
 
 enum LoginItemManager {
 
-    /// Whether autostart is currently enabled. Reading is cheap.
+    /// Whether the user has turned autostart on. `.requiresApproval` counts:
+    /// the item IS registered and only waits for the user's OK in System
+    /// Settings → Login Items — reporting it as "off" would make the
+    /// Preferences toggle flip off and unregister it.
     static var isEnabled: Bool {
         if #available(macOS 13.0, *) {
-            return SMAppService.mainApp.status == .enabled
+            let status = SMAppService.mainApp.status
+            return status == .enabled || status == .requiresApproval
         }
         return false
     }
@@ -29,12 +33,13 @@ enum LoginItemManager {
             Diag.log("Login item: macOS < 13, autostart unsupported")
             return false
         }
+        // Already in the requested state → nothing to do. (Unregistering an
+        // item that isn't registered throws, which only produced log noise.)
+        if enabled == isEnabled {
+            return true
+        }
         do {
             if enabled {
-                if SMAppService.mainApp.status == .enabled {
-                    Diag.log("Login item: already enabled")
-                    return true
-                }
                 try SMAppService.mainApp.register()
                 Diag.log("Login item: registered")
             } else {

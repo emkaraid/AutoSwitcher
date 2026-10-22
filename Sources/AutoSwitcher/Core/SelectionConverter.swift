@@ -5,11 +5,8 @@
 //  ⌥⇧R: convert the currently selected text to the other layout.
 //  Works through the pasteboard: synthesize ⌘C, read the selection,
 //  convert by dominant script, paste the result with ⌘V, then restore
-//  the user's previous clipboard string.
-//
-//  Limitation (documented): only the *string* flavor of the old clipboard
-//  is restored. Non-text clipboard content (images, files) is lost when
-//  the shortcut is used — same trade-off Caramba/Punto make.
+//  the user's previous clipboard — every item and every type (text, rich
+//  text, images, file references), not just the plain-text flavour.
 //
 
 import AppKit
@@ -17,6 +14,12 @@ import CoreGraphics
 import Carbon.HIToolbox
 
 enum SelectionConverter {
+
+    /// One conversion at a time: a second ⌥⇧R while the first is still
+    /// juggling the clipboard would snapshot OUR temporary content and
+    /// "restore" that, losing the user's real clipboard.
+    private static let busyLock = NSLock()
+    private static var busy = false
 
     /// Pure conversion logic (unit-tested): decide the dominant script of
     /// the text and convert it to the opposite layout. Returns nil when the
@@ -41,9 +44,22 @@ enum SelectionConverter {
     /// synthesized ⌘C/⌘V events are tagged with the corrector sentinel so
     /// our own tap ignores them.
     static func convertSelection(layoutManager: LayoutManager) {
+        busyLock.lock()
+        if busy {
+            busyLock.unlock()
+            return
+        }
+        busy = true
+        busyLock.unlock()
+
         DispatchQueue.global(qos: .userInitiated).async {
+            defer {
+                busyLock.lock()
+                busy = false
+                busyLock.unlock()
+            }
             let pb = NSPasteboard.general
-            let savedString = pb.string(forType: .string)
+            let saved = snapshot(pb)
             let beforeCount = pb.changeCount
 
             // The user is physically still holding ⌥⇧ from the shortcut.
@@ -60,12 +76,17 @@ enum SelectionConverter {
                 waited += 0.05
             }
 
-            guard pb.changeCount != beforeCount,
-                  let selection = pb.string(forType: .string),
+            // Nothing selected → the app didn't touch the clipboard, and
+            // neither may we.
+            guard pb.changeCount != beforeCount else {
+                Diag.log("⌥⇧R: nothing selected")
+                return
+            }
+            guard let selection = pb.string(forType: .string),
                   !selection.isEmpty,
                   let (converted, target) = convertDominant(selection) else {
                 Diag.log("⌥⇧R: no convertible selection")
-                restore(pb, savedString)
+                restore(pb, saved)
                 return
             }
 
@@ -80,7 +101,7 @@ enum SelectionConverter {
             layoutManager.switchTo(target)
 
             Thread.sleep(forTimeInterval: 0.15)
-            restore(pb, savedString)
+            restore(pb, saved)
             Diag.log("⌥⇧R: selection converted to \(target.rawValue) (\(converted.count) chars)")
         }
     }
@@ -102,9 +123,25 @@ enum SelectionConverter {
         }
     }
 
-    private static func restore(_ pb: NSPasteboard, _ saved: String?) {
+    /// Deep copy of everything on the pasteboard, item by item and type by
+    /// type, so it can be put back exactly as it was.
+    private static func snapshot(_ pb: NSPasteboard) -> [NSPasteboardItem] {
+        (pb.pasteboardItems ?? []).map { item in
+            let copy = NSPasteboardItem()
+            for type in item.types {
+                if let data = item.data(forType: type) {
+                    copy.setData(data, forType: type)
+                }
+            }
+            return copy
+        }
+    }
+
+    private static func restore(_ pb: NSPasteboard, _ saved: [NSPasteboardItem]) {
         pb.clearContents()
-        if let saved { pb.setString(saved, forType: .string) }
+        if !saved.isEmpty {
+            pb.writeObjects(saved)
+        }
     }
 
     private static func postShortcut(virtualKey: CGKeyCode) {

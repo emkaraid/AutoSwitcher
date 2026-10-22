@@ -25,37 +25,73 @@ struct LayoutDetector {
 
     // MARK: - Mappings
 
-    /// Character at the same physical key in US ↔ Russian layouts.
-    /// Source: standard Apple Russian layout (com.apple.keylayout.Russian).
-    /// We include both lower and upper case so we can map quickly without
-    /// repeatedly lowercasing.
-    private static let enToRu: [Character: Character] = [
-        "`": "ё", "~": "Ё",
+    /// Character at the same physical key in the EN ↔ RU layouts.
+    ///
+    /// The live table is built at runtime from the layouts the user really
+    /// has enabled (LayoutManager.refreshKeyMapIfNeeded) — Apple "Russian"
+    /// and "Russian – PC" disagree on punctuation and on ё (on the Mac
+    /// layout `?` stays `?`, the comma is ⇧6, ё sits on `\`).
+    ///
+    /// Until then (and if building fails) this fallback is used: letters
+    /// plus the punctuation keys that carry the SAME letters in every
+    /// ЙЦУКЕН variant. Layout-specific punctuation is deliberately absent —
+    /// an absent entry passes through unchanged, a wrong one corrupts text.
+    private static let fallbackEnToRu: [Character: Character] = [
         "q": "й", "w": "ц", "e": "у", "r": "к", "t": "е", "y": "н",
         "u": "г", "i": "ш", "o": "щ", "p": "з", "[": "х", "]": "ъ",
         "a": "ф", "s": "ы", "d": "в", "f": "а", "g": "п", "h": "р",
         "j": "о", "k": "л", "l": "д", ";": "ж", "'": "э",
         "z": "я", "x": "ч", "c": "с", "v": "м", "b": "и", "n": "т",
-        "m": "ь", ",": "б", ".": "ю", "/": ".",
+        "m": "ь", ",": "б", ".": "ю",
         "Q": "Й", "W": "Ц", "E": "У", "R": "К", "T": "Е", "Y": "Н",
         "U": "Г", "I": "Ш", "O": "Щ", "P": "З", "{": "Х", "}": "Ъ",
         "A": "Ф", "S": "Ы", "D": "В", "F": "А", "G": "П", "H": "Р",
         "J": "О", "K": "Л", "L": "Д", ":": "Ж", "\"": "Э",
         "Z": "Я", "X": "Ч", "C": "С", "V": "М", "B": "И", "N": "Т",
-        "M": "Ь", "<": "Б", ">": "Ю", "?": ","
+        "M": "Ь", "<": "Б", ">": "Ю"
     ]
 
-    private static let ruToEn: [Character: Character] = {
+    // Read from the tap (main) and from SelectionConverter (background),
+    // written from main — guarded by `mapLock`.
+    private static let mapLock = NSLock()
+    private static var liveEnToRu: [Character: Character] = fallbackEnToRu
+    private static var liveRuToEn: [Character: Character] = {
         var dict: [Character: Character] = [:]
-        for (k, v) in enToRu { dict[v] = k }
+        for (k, v) in fallbackEnToRu { dict[v] = k }
         return dict
     }()
+
+    private static var enToRu: [Character: Character] {
+        mapLock.lock(); defer { mapLock.unlock() }
+        return liveEnToRu
+    }
+
+    private static var ruToEn: [Character: Character] {
+        mapLock.lock(); defer { mapLock.unlock() }
+        return liveRuToEn
+    }
+
+    /// Install a table derived from the real layouts. `pairs` is ordered
+    /// (unshifted before shifted); the first pair wins on any collision so
+    /// the result is deterministic.
+    static func installKeyMap(_ pairs: [(Character, Character)]) {
+        var forward: [Character: Character] = [:]
+        var backward: [Character: Character] = [:]
+        for (en, ru) in pairs {
+            if forward[en] == nil { forward[en] = ru }
+            if backward[ru] == nil { backward[ru] = en }
+        }
+        mapLock.lock()
+        liveEnToRu = forward
+        liveRuToEn = backward
+        mapLock.unlock()
+    }
 
     private static let russianVowels: Set<Character> = Set("аеёиоуыэюяАЕЁИОУЫЭЮЯ")
     private static let englishVowels: Set<Character> = Set("aeiouyAEIOUY")
 
     /// True when `ch` sits on a key that produces a Cyrillic LETTER in the
-    /// Russian layout (";" → ж, "," → б, "." → ю, "[" → х, "'" → э, "`" → ё…).
+    /// Russian layout (";" → ж, "," → б, "." → ю, "[" → х, "'" → э…).
     /// Such characters are word content typed in the wrong layout and must
     /// NOT be treated as word boundaries — otherwise a Russian word typed in
     /// EN mode (";bpym" = "жизнь") is split in two and never corrected.

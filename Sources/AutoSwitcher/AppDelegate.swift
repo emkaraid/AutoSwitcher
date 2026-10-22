@@ -50,6 +50,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         // Warm the frontmost-app / ignore-list cache before the tap starts.
         AppIgnoreList.startObserving()
 
+        // Build the EN↔RU character table from the user's real layouts
+        // before the first keystroke is analysed. (`current()` first, so the
+        // variant in use right now is the one the table is built from.)
+        _ = layoutManager.current()
+        layoutManager.refreshKeyMapIfNeeded()
+
         // Kick off the two-permission probe (Accessibility + Input Monitoring).
         // The native system prompts will surface here on first launch; on
         // subsequent launches we just read the cached TCC decisions.

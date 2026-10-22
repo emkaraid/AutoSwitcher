@@ -77,8 +77,11 @@ enum Diag {
     /// the next dispatch.
     static func log(_ message: String) {
         let line = "\(isoFormatter.string(from: Date()))  \(message)\n"
-        // NSLog: unified log path.
-        NSLog("AutoSwitcher: \(message)")
+        // NSLog: unified log path. The message must be an ARGUMENT, never
+        // the format string: a typed "%" (verbose mode logs words) or an
+        // error description containing "%@" would otherwise be parsed as a
+        // format specifier — garbage output at best, a crash at worst.
+        NSLog("AutoSwitcher: %@", message)
         // File path: append + sync. We use a sync barrier inside the queue
         // for the actual fsync so concurrent log calls don't interleave,
         // but the queue dispatch itself stays async so the caller doesn't

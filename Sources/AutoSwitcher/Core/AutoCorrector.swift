@@ -6,6 +6,12 @@
 //  using synthesized CGEvents. Posts events with a brief sleep between them
 //  so the focused app has time to settle and we don't race ourselves.
 //
+//  Type-ahead: a correction takes ~0.1 s, and fast typists keep going. The
+//  KeyboardMonitor swallows physical keystrokes while `isCorrecting` is set
+//  and hands them back here; we replay them right after our own events, in
+//  order, rendered in the layout we just switched to. Without this the
+//  user's keys interleave with our backspaces and the text gets corrupted.
+//
 
 import Foundation
 import CoreGraphics
@@ -37,12 +43,28 @@ final class AutoCorrector {
     /// can ignore them when they come back through the system tap.
     static let syntheticEventUserData: Int64 = 0xA17C0_DE
 
+    /// Marks the user's own keystrokes that we re-post after a correction.
+    /// Unlike synthetic events the monitor DOES track these (buffer, last
+    /// word) — they are real typing, just delivered a few ms late.
+    static let replayEventUserData: Int64 = 0xA17C0_DF
+
+    /// A keystroke swallowed during a correction, ready to be replayed.
+    enum ReplayItem {
+        case text(String)                  // a text key, already rendered for the target layout
+        case key(CGKeyCode, CGEventFlags)  // shortcuts, Delete, arrows… — re-pressed by key code
+    }
+
+    /// Installed by KeyboardMonitor. Called on the main thread; returns —
+    /// and clears — the keystrokes swallowed so far, rendered for `target`.
+    var takeQueuedKeys: ((KeyboardLayout) -> [ReplayItem])?
+
     private let layoutManager: LayoutManager
 
     /// Records the last correction so SmartUndoManager can revert it.
     struct LastCorrection {
-        let originalWrongText: String   // what the user actually typed
-        let correctedText: String       // what we typed instead
+        let originalWrongText: String   // the word the user actually typed
+        let originalTrailing: String    // the boundary they typed after it, as typed
+        let correctedText: String       // what we typed instead (word + converted boundary)
         let fromLayout: KeyboardLayout  // layout active when user was typing
         let toLayout: KeyboardLayout    // layout we switched to
         let timestamp: Date
@@ -66,22 +88,27 @@ final class AutoCorrector {
     }
 
     /// Run the correction sequence. `originalWrong` is the literal text the
-    /// user typed; `corrected` is the rendition in the target layout.
-    /// `trailingKey` (e.g. Return for correct-on-Enter) is pressed after the
-    /// corrected text is retyped — the caller ate the physical key event.
+    /// user typed and `originalTrailing` the boundary they typed after it
+    /// (kept so a revert restores exactly what was typed); `corrected` is
+    /// the rendition in the target layout. `trailingKey` (Return for
+    /// correct-on-Enter) is re-pressed with its original modifiers after the
+    /// corrected text — the caller ate the physical key event.
     /// Performed on a background queue to avoid blocking the event tap.
+    /// Returns false when another correction is still running.
+    @discardableResult
     func performCorrection(originalWrong: String,
+                           originalTrailing: String = "",
                            corrected: String,
                            fromLayout: KeyboardLayout,
                            toLayout: KeyboardLayout,
                            playSound: Bool,
-                           trailingKey: CGKeyCode? = nil,
-                           isManual: Bool = false) {
+                           trailingKey: (code: CGKeyCode, flags: CGEventFlags)? = nil,
+                           isManual: Bool = false) -> Bool {
         // Guard against re-entrancy.
         lock.lock()
         if _isCorrecting {
             lock.unlock()
-            return
+            return false
         }
         _isCorrecting = true
         lock.unlock()
@@ -89,17 +116,14 @@ final class AutoCorrector {
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             guard let self else { return }
             defer {
-                self.lock.lock()
-                self._isCorrecting = false
-                self.lock.unlock()
+                self.replayQueuedKeysAndFinish(target: toLayout)
                 Diag.log("correction finished")
             }
 
             Diag.log("correction starting — delete \(originalWrong.count), type \(corrected.count) unicode chars")
 
             // 1) Delete the wrong characters with backspaces.
-            let count = originalWrong.count
-            for _ in 0..<count {
+            for _ in 0..<originalWrong.count {
                 self.postKey(virtualKey: CGKeyCode(kVK_Delete), modifiers: [])
                 Thread.sleep(forTimeInterval: 0.005)
             }
@@ -118,10 +142,11 @@ final class AutoCorrector {
                 Thread.sleep(forTimeInterval: 0.003)
             }
 
-            // 3b) Press the eaten trailing key (Return for correct-on-Enter).
+            // 3b) Press the eaten trailing key (Return for correct-on-Enter),
+            // with its modifiers: ⇧⏎ must stay a newline, not "send".
             if let key = trailingKey {
                 Thread.sleep(forTimeInterval: 0.01)
-                self.postKey(virtualKey: key, modifiers: [])
+                self.postKey(virtualKey: key.code, modifiers: key.flags)
             }
 
             // 4) Remember this correction for Smart Undo — but NOT when a
@@ -131,6 +156,7 @@ final class AutoCorrector {
             if trailingKey == nil {
                 let record = LastCorrection(
                     originalWrongText: originalWrong,
+                    originalTrailing: originalTrailing,
                     correctedText: corrected,
                     fromLayout: fromLayout,
                     toLayout: toLayout,
@@ -155,18 +181,22 @@ final class AutoCorrector {
                 }
             }
         }
+        return true
     }
 
     /// Revert the last correction: delete the corrected text, switch layout
-    /// back, type the original wrong text. Called by SmartUndoManager.
-    func revertLastCorrection() {
-        guard let last = lastCorrection else { return }
+    /// back, retype exactly what the user typed (word AND its boundary —
+    /// otherwise the space after the word silently disappears).
+    /// Returns false when nothing could be reverted.
+    @discardableResult
+    func revertLastCorrection() -> Bool {
+        guard let last = lastCorrection else { return false }
 
         // Same re-entrancy guard.
         lock.lock()
         if _isCorrecting {
             lock.unlock()
-            return
+            return false
         }
         _isCorrecting = true
         lock.unlock()
@@ -174,9 +204,7 @@ final class AutoCorrector {
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             guard let self else { return }
             defer {
-                self.lock.lock()
-                self._isCorrecting = false
-                self.lock.unlock()
+                self.replayQueuedKeysAndFinish(target: last.fromLayout)
             }
 
             for _ in 0..<last.correctedText.count {
@@ -188,7 +216,7 @@ final class AutoCorrector {
             _ = self.layoutManager.switchTo(last.fromLayout)
             Thread.sleep(forTimeInterval: 0.020)
 
-            for ch in last.originalWrongText {
+            for ch in last.originalWrongText + last.originalTrailing {
                 self.postUnicode(String(ch))
                 Thread.sleep(forTimeInterval: 0.003)
             }
@@ -201,25 +229,67 @@ final class AutoCorrector {
             // usefulness counters.
             StatsStore.shared.recordRevert()
         }
+        return true
+    }
+
+    // MARK: - Type-ahead replay
+
+    /// Hand-off protocol with the monitor: under `main.sync` (the tap runs
+    /// on main, so this is atomic with respect to it) take the swallowed
+    /// keys; if there are none, clear `isCorrecting` in the same block — no
+    /// keystroke can slip between "queue empty" and "flag cleared". Keys
+    /// pressed while we replay are swallowed too and picked up by the next
+    /// round, which preserves their order.
+    private func replayQueuedKeysAndFinish(target: KeyboardLayout) {
+        let maxRounds = 20
+        for round in 1...maxRounds {
+            let isLastRound = round == maxRounds
+            var items: [ReplayItem] = []
+            DispatchQueue.main.sync {
+                items = self.takeQueuedKeys?(target) ?? []
+                if items.isEmpty || isLastRound {
+                    self.lock.lock()
+                    self._isCorrecting = false
+                    self.lock.unlock()
+                }
+            }
+            for item in items {
+                switch item {
+                case .text(let text):
+                    postUnicode(text, tag: Self.replayEventUserData)
+                case .key(let code, let flags):
+                    postKey(virtualKey: code, modifiers: flags, tag: Self.replayEventUserData)
+                }
+                Thread.sleep(forTimeInterval: 0.003)
+            }
+            if items.isEmpty || isLastRound { return }
+            if round == 1 {
+                Diag.log("replayed \(items.count) key(s) typed during the correction")
+            }
+            // Let the replayed events clear our own tap before checking again.
+            Thread.sleep(forTimeInterval: 0.010)
+        }
     }
 
     // MARK: - Low-level CGEvent helpers
 
-    private func postKey(virtualKey: CGKeyCode, modifiers: CGEventFlags) {
+    private func postKey(virtualKey: CGKeyCode, modifiers: CGEventFlags,
+                         tag: Int64 = AutoCorrector.syntheticEventUserData) {
         guard let source = CGEventSource(stateID: .combinedSessionState) else { return }
         if let down = CGEvent(keyboardEventSource: source, virtualKey: virtualKey, keyDown: true) {
             down.flags = modifiers
-            down.setIntegerValueField(.eventSourceUserData, value: AutoCorrector.syntheticEventUserData)
+            down.setIntegerValueField(.eventSourceUserData, value: tag)
             down.post(tap: .cghidEventTap)
         }
         if let up = CGEvent(keyboardEventSource: source, virtualKey: virtualKey, keyDown: false) {
             up.flags = modifiers
-            up.setIntegerValueField(.eventSourceUserData, value: AutoCorrector.syntheticEventUserData)
+            up.setIntegerValueField(.eventSourceUserData, value: tag)
             up.post(tap: .cghidEventTap)
         }
     }
 
-    private func postUnicode(_ string: String) {
+    private func postUnicode(_ string: String,
+                             tag: Int64 = AutoCorrector.syntheticEventUserData) {
         guard let source = CGEventSource(stateID: .combinedSessionState) else { return }
         // IMPORTANT: keyboardSetUnicodeString does not strictly guarantee that
         // the source bytes are copied before the call returns — in practice it
@@ -236,7 +306,7 @@ final class AutoCorrector {
         // valid for the duration of its .post() call.
         let utf16Down = Array(string.utf16)
         if let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true) {
-            down.setIntegerValueField(.eventSourceUserData, value: AutoCorrector.syntheticEventUserData)
+            down.setIntegerValueField(.eventSourceUserData, value: tag)
             utf16Down.withUnsafeBufferPointer { buf in
                 down.keyboardSetUnicodeString(stringLength: utf16Down.count, unicodeString: buf.baseAddress)
                 down.post(tap: .cghidEventTap)
@@ -244,7 +314,7 @@ final class AutoCorrector {
         }
         let utf16Up = Array(string.utf16)
         if let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) {
-            up.setIntegerValueField(.eventSourceUserData, value: AutoCorrector.syntheticEventUserData)
+            up.setIntegerValueField(.eventSourceUserData, value: tag)
             utf16Up.withUnsafeBufferPointer { buf in
                 up.keyboardSetUnicodeString(stringLength: utf16Up.count, unicodeString: buf.baseAddress)
                 up.post(tap: .cghidEventTap)
