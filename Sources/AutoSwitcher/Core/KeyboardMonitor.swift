@@ -53,6 +53,10 @@ final class KeyboardMonitor {
     /// we can prove in the logs that events are actually flowing.
     private var firstEventLogged = false
 
+    /// While permissions are missing start() is retried on every settings
+    /// change; log the failure once instead of on every attempt.
+    private var tapFailureLogged = false
+
     // MARK: - Option-tap / revert-safety state (main-runloop confined)
 
     /// True while a "clean ⌥ tap" is still possible: Option went down alone
@@ -133,9 +137,13 @@ final class KeyboardMonitor {
             callback: KeyboardMonitor.tapCallback,
             userInfo: selfPtr
         ) else {
-            Diag.log("FAILED to create CGEventTap — Accessibility may have been revoked. Toggle the app off and on again in System Settings → Privacy & Security → Accessibility.")
+            if !tapFailureLogged {
+                tapFailureLogged = true
+                Diag.log("FAILED to create CGEventTap — Accessibility may have been revoked. Toggle the app off and on again in System Settings → Privacy & Security → Accessibility.")
+            }
             return
         }
+        tapFailureLogged = false
         Diag.log("CGEventTap installed successfully")
 
         self.eventTap = tap
